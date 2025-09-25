@@ -1,0 +1,808 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Apr 11 10:00:55 2025
+
+@author: zhaobinghui
+"""
+
+import numpy as np
+import tensorflow as tf
+#import tensorflow_addons as tfa
+import keras
+import keras.backend as K
+from keras.layers import (Layer, BatchNormalization, LayerNormalization, Conv2D, Conv1D, Reshape, Conv2DTranspose, Embedding, 
+    Activation, Dense, Dropout, MultiHeadAttention, add, Input, Concatenate, GlobalAveragePooling1D, 
+     AveragePooling1D, AveragePooling2D,GlobalAveragePooling2D,MaxPooling1D,MaxPooling2D, Multiply)
+from keras.models import Model
+import hdf5storage 
+import matplotlib.pyplot as plt
+import scipy.io as io
+from scipy.io import loadmat as load
+from scipy.io import savemat as save
+from sklearn.model_selection import train_test_split
+from tensorflow.keras import layers, models, regularizers
+from keras.layers.core import Lambda
+from keras.optimizers import Nadam, Adam
+from keras.regularizers import l2
+import pywt
+import math
+import random
+import gc
+from tensorflow.keras.callbacks import Callback, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+import pickle
+import os
+
+   
+class LayerwiseLRAdam(Adam):
+    def __init__(self, special_layers, lr_special=0.0001, lr_normal=0.001, **kwargs):
+        super().__init__(learning_rate=lr_normal, **kwargs)
+        self.special_layers = special_layers
+        self.lr_special = lr_special
+        self.lr_normal = lr_normal
+    
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, 'm') 
+            self.add_slot(var, 'v')  
+    def _resource_apply_dense(self, grad, var, apply_state=None):
+        if not hasattr(self, '_slots'):
+            self._slots = {}
+        
+        var_key = self._var_key(var)
+        if var_key not in self._slots:
+            self._slots[var_key] = {}
+            self.add_slot(var, 'm')
+            self.add_slot(var, 'v')
+        
+        lr_value = self.lr_special if any(layer_name in var.name for layer_name in self.special_layers) else self.lr_normal
+        
+        if hasattr(lr_value, '__call__'):
+            lr_value = lr_value(self.iterations)
+        lr = tf.convert_to_tensor(lr_value, dtype=var.dtype)
+
+        beta_1 = self._get_hyper('beta_1', var.dtype)
+        beta_2 = self._get_hyper('beta_2', var.dtype)
+        
+
+        epsilon = tf.convert_to_tensor(self.epsilon, dtype=var.dtype)
+        
+        m = self.get_slot(var, 'm')
+        v = self.get_slot(var, 'v')
+        
+        local_step = tf.cast(self.iterations + 1, var.dtype)
+
+        beta_1_power = tf.pow(beta_1, local_step)
+        beta_2_power = tf.pow(beta_2, local_step)
+        lr_t = lr * tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
+
+        m_t = beta_1 * m + (1 - beta_1) * grad
+        v_t = beta_2 * v + (1 - beta_2) * tf.square(grad)
+        var_t = var - lr_t * m_t / (tf.sqrt(v_t) + epsilon)
+
+        return tf.group(*[var.assign(var_t), m.assign(m_t), v.assign(v_t)])
+    
+    def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
+        if not hasattr(self, '_slots'):
+            self._slots = {}
+
+        var_key = self._var_key(var)
+        if var_key not in self._slots:
+            self._slots[var_key] = {}
+            self.add_slot(var, 'm')
+            self.add_slot(var, 'v')
+
+        lr_value = self.lr_special if any(layer_name in var.name for layer_name in self.special_layers) else self.lr_normal
+
+        if hasattr(lr_value, '__call__'):
+            lr_value = lr_value(self.iterations)
+        
+        lr = tf.convert_to_tensor(lr_value, dtype=var.dtype)
+
+        beta_1 = self._get_hyper('beta_1', var.dtype)
+        beta_2 = self._get_hyper('beta_2', var.dtype)
+
+        epsilon = tf.convert_to_tensor(self.epsilon, dtype=var.dtype)
+        
+        m = self.get_slot(var, 'm')
+        v = self.get_slot(var, 'v')
+
+        local_step = tf.cast(self.iterations + 1, var.dtype)
+
+        beta_1_power = tf.pow(beta_1, local_step)
+        beta_2_power = tf.pow(beta_2, local_step)
+        lr_t = lr * tf.sqrt(1 - beta_2_power) / (1 - beta_1_power)
+
+        m_t = beta_1 * m
+        m_t = tf.tensor_scatter_nd_add(m_t, tf.expand_dims(indices, 1), (1 - beta_1) * grad)
+        
+        v_t = beta_2 * v
+        v_t = tf.tensor_scatter_nd_add(v_t, tf.expand_dims(indices, 1), (1 - beta_2) * tf.square(grad))
+        
+        var_t = var - lr_t * m_t / (tf.sqrt(v_t) + epsilon)
+
+        return tf.group(*[var.assign(var_t), m.assign(m_t), v.assign(v_t)])
+    
+    def _var_key(self, var):
+        if hasattr(var, 'op'):
+            return var.op.name
+        return var.name
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'special_layers': self.special_layers,
+            'lr_special': self.lr_special,
+            'lr_normal': self.lr_normal})
+        return config
+
+
+class TrackLayersWithSmallBatch(Callback):
+    def __init__(self, train_data_small, layer_names):
+       
+        super().__init__()
+
+        self.X_small, self.Z_small = train_data_small  
+        self.layer_names = layer_names
+
+        self.layer_stats = {name: [] for name in layer_names}  
+        self.intermediate_model = tf.keras.models.Model(
+            inputs=model.input,
+            outputs=[model.get_layer(name).output for name in layer_names])
+
+    def on_epoch_end(self, epoch, logs=None):
+        intermediate_outputs = self.intermediate_model.predict(
+            [self.X_small, self.Z_small], 
+            verbose=0,  
+            batch_size=1)
+
+        for i, name in enumerate(self.layer_names):
+            mean_val = np.mean(intermediate_outputs[i].flatten())
+            self.layer_stats[name].append(mean_val)
+
+        del intermediate_outputs
+        gc.collect()  
+        tf.keras.backend.clear_session() 
+
+
+early_stopping = EarlyStopping(
+    monitor='val_y_accuracy',        
+    patience=100,                 
+    verbose=1,                   
+    mode='max',                  
+    restore_best_weights=True,  
+    min_delta=1e-7)             
+
+
+lr_schedule = ExponentialDecay(
+    initial_learning_rate=0.0005,
+    decay_steps=5400, 
+    decay_rate=0.98,
+    staircase=True)
+
+
+lr_schedule2 = ExponentialDecay(
+    initial_learning_rate=0.00005,
+    decay_steps=54000,  
+    decay_rate=1.0, 
+    staircase=True)
+
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(f"GPU failed: {e}")
+
+
+def abs_backend(inputs):
+    return K.abs(inputs)
+
+def expand_dim_backend(inputs):
+    return K.expand_dims(inputs,1)
+
+def sign_backend(inputs):
+    return K.sign(inputs)
+
+def pad_backend(inputs, in_channels, out_channels):
+    pad_dim = (out_channels - in_channels)//2
+    inputs = K.expand_dims(inputs)
+    inputs = K.spatial_2d_padding(inputs,padding=((0,0),(pad_dim,pad_dim)))
+    return K.squeeze(inputs,-1)
+
+def residual_shrinkage_block(incoming, nb_blocks, out_channels, downsample=False,
+                             downsample_strides=2):
+  
+  
+    residual = incoming
+    in_channels = incoming.get_shape().as_list()[-1]
+  
+    for _ in range(nb_blocks):
+      
+        identity = residual
+      
+        if not downsample:
+            downsample_strides = 1
+      
+        residual = BatchNormalization()(residual)
+        residual = Activation('relu')(residual)
+        residual = Conv1D(out_channels, 3, strides=downsample_strides, 
+                          padding='same', kernel_initializer='he_normal', 
+                          kernel_regularizer=l2(1e-4))(residual)
+      
+        residual = BatchNormalization()(residual)
+        residual = Activation('relu')(residual)
+        residual = Conv1D(out_channels, 3, padding='same', kernel_initializer='he_normal', 
+                          kernel_regularizer=l2(1e-4))(residual)
+      
+        residual_abs = Lambda(abs_backend)(residual)
+        abs_mean = GlobalAveragePooling1D()(residual_abs)
+      
+        scales = Dense(out_channels, activation=None, kernel_initializer='he_normal', 
+                       kernel_regularizer=l2(1e-4))(abs_mean)
+        scales = BatchNormalization()(scales)
+        scales = Activation('relu')(scales)
+        scales = Dense(out_channels, activation='sigmoid', kernel_regularizer=l2(1e-4))(scales)
+        scales = Lambda(expand_dim_backend)(scales)
+
+        thres = keras.layers.multiply([abs_mean, scales])
+
+        sub = keras.layers.subtract([residual_abs, thres])
+        zeros = keras.layers.subtract([sub, sub])
+        n_sub = keras.layers.maximum([sub, zeros])
+        residual = keras.layers.multiply([Lambda(sign_backend)(residual), n_sub])
+
+        if downsample_strides > 1:
+            identity = AveragePooling1D(pool_size=1, strides=2)(identity)
+
+        if in_channels != out_channels:
+        
+            identity = Lambda(pad_backend, arguments={'in_channels':in_channels,'out_channels':out_channels})(identity)
+        
+        residual = keras.layers.add([residual, identity])
+    return residual
+
+
+
+def residual_shrinkage_block2D(incoming, nb_blocks, size, out_channels, downsample=False,
+                             downsample_strides=2):
+    residual = incoming
+    in_channels = incoming.get_shape().as_list()[-1]
+    
+    for i in range(nb_blocks):
+        
+        identity = residual
+        
+        if not downsample: 
+            downsample_strides = 1
+        residual = BatchNormalization()(residual)
+        residual = Activation('relu')(residual)
+        residual = Conv2D(out_channels, size, strides=(downsample_strides, downsample_strides), 
+                          padding='same', kernel_initializer='he_normal', 
+                          kernel_regularizer=l2(1e-4))(residual)
+        
+        residual = BatchNormalization()(residual)
+        residual = Activation('relu')(residual)
+        residual = Conv2D(out_channels, size, padding='same', kernel_initializer='he_normal', 
+                          kernel_regularizer=l2(1e-4))(residual)
+                       
+        # Calculate global means
+        residual_abs = Lambda(abs_backend)(residual)
+        abs_mean = GlobalAveragePooling2D()(residual_abs)
+        abs_mean1 = Reshape((out_channels,1))(abs_mean)
+        
+        # ECA
+        kernel_size = int(abs((math.log(out_channels, 2) + 1) /2))
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        scales = Conv1D(1, kernel_size,activation='sigmoid', padding='same')(abs_mean1)
+        scales = Reshape((1, out_channels))(scales)
+    
+        thres = keras.layers.multiply([abs_mean, scales])
+        
+        # Soft thresholding
+        sub = keras.layers.subtract([residual_abs, thres])
+        zeros = keras.layers.subtract([sub, sub])
+        n_sub = keras.layers.maximum([sub, zeros])
+        residual = keras.layers.multiply([Lambda(sign_backend)(residual), n_sub])
+        
+        if downsample_strides > 1:
+            identity = AveragePooling2D(pool_size=(1, 1), strides=(2, 2))(identity)
+            
+        if in_channels != out_channels:
+            identity = Lambda(pad_backend, arguments={'in_channels':in_channels,'out_channels':out_channels})(identity)
+        
+        residual = keras.layers.add([residual, identity])
+    
+    return residual
+
+
+def zzz(input):
+    [cwtmatr, frequencies] = pywt.cwt(input, scales, wavename, 1.0 / sampling_rate)
+    z_input = abs(cwtmatr[:,:])
+    return z_input
+
+
+class AdaptiveWeightMerge(tf.keras.layers.Layer):
+    def __init__(self):
+        super(AdaptiveWeightMerge, self).__init__()
+        self.w = self.add_weight(
+            name="adaptive_weight",
+            shape=(1,),
+            initializer="zeros",
+            trainable=True)
+
+    def call(self, inputs):
+        prob_a, prob_b = inputs
+        alpha = tf.sigmoid(self.w) 
+        return alpha * prob_a + (1 - alpha) * prob_b
+
+
+
+
+num_boxing = 24000
+len_boxing = 4096
+chouxi = 2
+len_shuru= int(len_boxing/chouxi)
+ewaichouxi = 2
+
+
+import pickle
+with open('nature_data','rb') as file:
+     nature = pickle.load(file)
+
+with open('unnature','rb') as file:
+     unnature = pickle.load(file)
+
+X0 = [*nature, *unnature]
+X0 = [X0[i][:len_boxing] for i in range(len(X0))]
+X0 = [X0[i][ ::chouxi]for i in range(len(X0))]
+y0 = np.concatenate([np.zeros(len(nature)), np.ones(len(unnature))])  
+
+index = [i for i in range(len(X0))]
+random.shuffle(index)
+
+X = [X0[i] for i in index]
+y = [y0[i] for i in index]
+
+
+del nature, unnature, X0, y0
+X = X[:num_boxing]
+y = y[:num_boxing]
+
+
+sampling_rate = 50
+wavename = 'cgau8'
+totalscal = 256
+fc = pywt.central_frequency(wavename)
+cparam = 2 * fc * totalscal
+scales = cparam / np.arange(totalscal, 1, -1)
+
+
+Z = []
+for i in range(len(X)):
+    [cwtmatr, frequencies] = pywt.cwt(X[i], scales, wavename, 1.0 / sampling_rate)
+    Z.append(abs(cwtmatr[:,:]))
+    if len(Z) % (num_boxing/10) == 0:
+        print(len(Z)/num_boxing)
+    
+X = np.array(X) 
+Z = np.array(Z) 
+Z = Z[:,122:250,::ewaichouxi]
+
+y = np.array([int(yy) for yy in y])
+
+X_train, X_test, Z_train, Z_test, y_train, y_test = train_test_split(
+        X, Z, y, test_size=0.1, random_state=42)#0.2
+
+del X,Z,y,cwtmatr,index
+
+X_train = X_train.astype(np.float16).reshape(-1,len_shuru,1)
+X_test = X_test.astype(np.float16).reshape(-1,len_shuru,1)
+Z_train = Z_train.astype(np.float16).reshape(-1,128,int(len_shuru/ewaichouxi),1)
+Z_test = Z_test.astype(np.float16).reshape(-1,128,int(len_shuru/ewaichouxi),1)
+y_train = y_train.astype(np.int16)
+y_test = y_test.astype(np.int16)
+
+
+
+class PositionalEncoding(layers.Layer):
+    def __init__(self, seq_len, embed_dim):
+        super(PositionalEncoding, self).__init__()
+        self.seq_len = seq_len
+        self.embed_dim = embed_dim
+
+    def build(self, input_shape):
+
+        position = tf.range(self.seq_len, dtype=tf.float32)[:, tf.newaxis]
+        div_term = tf.range(self.embed_dim, dtype=tf.float32)[tf.newaxis, :]
+        div_term = tf.pow(10000.0, -2.0 * (div_term // 2) / tf.cast(self.embed_dim, tf.float32))
+
+        angle_rads = position * div_term
+
+        sines = tf.math.sin(angle_rads[:, 0::2])
+        cosines = tf.math.cos(angle_rads[:, 1::2])
+
+        pos_encoding = tf.concat([sines, cosines], axis=-1)
+        pos_encoding = pos_encoding[tf.newaxis, ...] 
+        self.pos_encoding = tf.cast(pos_encoding, dtype=tf.float32)
+
+    def call(self, inputs):
+        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
+
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super(TransformerBlock, self).__init__()
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = keras.Sequential([
+            layers.Dense(ff_dim, activation="gelu", kernel_regularizer=regularizers.l2(1e-4)),
+            layers.Dropout(rate),
+            layers.Dense(embed_dim, kernel_regularizer=regularizers.l2(1e-4))
+        ])
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = layers.Dropout(rate)
+        self.dropout2 = layers.Dropout(rate)
+
+    def call(self, inputs, training):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+
+
+############ 1d ############
+x_input = keras.Input(shape=(len_shuru,1), dtype=tf.float16)
+transformer = Conv1D(16, 5, strides=2, activation='relu')(x_input)
+transformer = MaxPooling1D(2)(transformer)
+embed_dim = 64
+num_heads = 12
+ff_dim = 128
+transformer = layers.Dense(embed_dim)(transformer) 
+seq_len = len_shuru/chouxi  
+transformer = PositionalEncoding(seq_len, embed_dim)(transformer)
+transformer = BatchNormalization()(transformer)
+for _ in range(4):
+    transformer = TransformerBlock(embed_dim, num_heads, ff_dim)(transformer)
+    transformer = MaxPooling1D(pool_size=3, strides=2, padding='same')(transformer)
+
+transformer = layers.GlobalAveragePooling1D()(transformer)
+transformer = layers.Dropout(0.6)(transformer)
+
+
+############# 2d ############
+z_input = keras.Input(shape=(128, int(len_shuru/ewaichouxi),1), dtype=tf.float16)
+cnn = Conv2D(16, (1,1), activation='relu',  padding='same')(z_input)
+for _ in range(7):
+    cnn = residual_shrinkage_block2D(cnn, 1, 3, 16, downsample=True)
+    cnn = MaxPooling2D(pool_size=(1, 3), strides=(1, 2), padding='same')(cnn)   
+
+cnn = GlobalAveragePooling2D()(cnn)
+cnn = layers.Dropout(0.6)(cnn)
+
+
+
+############ decision ############
+attention = Dense(1, activation='sigmoid')(Concatenate()([cnn, transformer]))
+weighted_cnn = Multiply()([cnn, attention])
+weighted_trans = Multiply()([transformer, 1 - attention])
+ 
+merged = Concatenate()([weighted_cnn, weighted_trans])
+merged = Dense(64)(merged)
+merged = BatchNormalization()(merged)
+merged = Activation('relu')(merged)
+merged = Dropout(0.4)(merged)
+
+merged = Dense(32)(merged)
+merged = BatchNormalization()(merged)
+merged = Activation('relu')(merged)
+merged = Dropout(0.2)(merged)#0.2
+
+outputs = Dense(1, activation='sigmoid', name='y')(merged)
+output_2d = Dense(1, activation='sigmoid',name='2d')(cnn)
+output_1d = Dense(1, activation='sigmoid',name='1d')(transformer)
+
+validation_data = ([X_test, Z_test], [y_test, y_test, y_test])    
+model = Model(inputs=[x_input,z_input], outputs=[outputs, output_2d, output_1d, ])
+
+
+special_layers = ["x_input", "transformer", "output_1d", "attention", "weighted_cnn", "weighted_trans"]#, "outputs", "merged"
+ADAM = LayerwiseLRAdam(special_layers=special_layers,
+    lr_special=lr_schedule2, lr_normal=lr_schedule)#lr_schedule
+model.compile(optimizer = ADAM, loss= 'binary_crossentropy',    metrics=['accuracy'])
+model.summary()
+
+target_layers = ["dense_9"] 
+
+
+X_small = X_train[0:1]  
+Z_small = Z_train[0:1]  
+
+assert X_small.ndim == 3 and X_small.shape[0] == 1, f"X_small size failed：{X_small.shape}，需(1, {len_shuru}, 1)"
+assert Z_small.ndim == 4 and Z_small.shape[0] == 1, f"Z_small size failed：{Z_small.shape}，需(1, 128, ..., 1)"
+small_data = (X_small, Z_small)
+
+transformer_target_layers = ['transformer_block_1', 'transformer_block_3']        
+
+cnn_target_layers = ['conv2d_2','conv2d_6','conv2d_8']       
+
+
+def save_transformer_feature_maps(feat, layer_name, epoch, save_dir, cmap='plasma'):
+    trans_save_dir = os.path.join(save_dir, 'transformer_merged_features', layer_name)
+    os.makedirs(trans_save_dir, exist_ok=True)
+
+    feat = feat[0]
+    seq_len, channels = feat.shape
+    channels_to_save = min(channels, 64)  
+    
+    subplot_width = 2.0
+    subplot_height = 1.5
+    fig_width = subplot_width * 8
+    fig_height = subplot_height * 8
+    
+    fig, axes = plt.subplots(
+        nrows=8, ncols=8,
+        figsize=(fig_width, fig_height),
+        gridspec_kw={'wspace': 0.1, 'hspace': 0.4} )
+    
+    fig.suptitle(
+        f'Transformer Features | Epoch: {epoch}',
+        fontsize=22, y=0.99)
+    
+    for idx in range(channels_to_save):
+        row = idx // 8
+        col = idx % 8
+        ax = axes[row, col]
+        
+        single_feat = feat[:, idx]
+        single_feat = (single_feat - single_feat.min()) / (single_feat.max() - single_feat.min() + 1e-8)
+        
+        ax.plot(range(seq_len), single_feat, color='darkblue', linewidth=0.8)
+        ax.set_title(f'Ch {idx+1}', fontsize=8)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.97])  
+    
+
+    save_path = os.path.join(trans_save_dir, f'trans_{layer_name}_epoch{epoch}_merged.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Transformer feather map（{layer_name}）：{save_path}")
+
+
+
+def save_cnn_feature_maps(feat, layer_name, epoch, save_dir, cmap='viridis'):
+    cnn_save_dir = os.path.join(save_dir, 'cnn_merged_features', layer_name)
+    os.makedirs(cnn_save_dir, exist_ok=True)
+    
+
+    feat = feat[0] 
+    height, width, channels = feat.shape
+    channels_to_save = min(channels, 16) 
+
+    actual_pixel_size = max(height, width)  
+    aspect_ratio = width / height  
+
+    if actual_pixel_size < 32:
+        base_height = 1.5
+    elif actual_pixel_size < 64:
+        base_height = 2.0
+    else:
+        base_height = 2.5
+
+    subplot_width = base_height * aspect_ratio 
+    subplot_height = base_height
+
+    total_width = subplot_width * 4
+    total_height = subplot_height * 4
+    fig, axes = plt.subplots(
+        nrows=4, ncols=4,
+        figsize=(total_width, total_height),
+        gridspec_kw={'wspace': 0.1, 'hspace': 0.4})
+    
+    figsize=max(total_width, total_height)
+
+
+    fig.suptitle(
+        f'CNN Features | Epoch: {epoch}',
+        fontsize=14 if figsize < 8 else 16, 
+        y=0.99 )
+    
+    for idx in range(channels_to_save):
+        row = idx // 4
+        col = idx % 4
+        ax = axes[row, col]
+        
+        single_feat = feat[:, :, idx]
+        single_feat = (single_feat - single_feat.min()) / (single_feat.max() - single_feat.min() + 1e-8)
+
+        im = ax.imshow(single_feat, cmap=cmap, aspect='auto')  
+        
+        ax.set_title(
+            f'Kernel {idx+1}',
+            fontsize=14, 
+            pad=2 )
+        
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.axis('off') 
+
+    plt.tight_layout(rect=[0, 0, 0.5, 0.5]) 
+    
+    save_path = os.path.join(cnn_save_dir, f'cnn_{layer_name}_epoch{epoch}_fixed.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅CNN feather map：{save_path}")
+    
+
+class SaveMultiLayerFeaturesCallback(Callback):
+    def __init__(self, small_data, cnn_target_layers, trans_target_layers, save_root='feature_maps'):
+        super().__init__()
+        self.X_small, self.Z_small = small_data
+        self.save_root = save_root
+        self.target_epochs = set(range(1, 252, 50))
+
+        self.cnn_extractors = {
+            layer_name: Model(inputs=model.input[1], outputs=model.get_layer(layer_name).output)
+            for layer_name in cnn_target_layers}
+
+        self.trans_extractors = {
+            layer_name: Model(inputs=model.input[0], outputs=model.get_layer(layer_name).output)
+            for layer_name in trans_target_layers }
+
+    def on_epoch_end(self, epoch, logs=None):
+        current_epoch = epoch + 1
+        if current_epoch not in self.target_epochs:
+            return
+        
+
+        for layer_name, extractor in self.cnn_extractors.items():
+            cnn_feat = extractor.predict(self.Z_small, verbose=0)
+            save_cnn_feature_maps(
+                feat=cnn_feat,
+                layer_name=layer_name,
+                epoch=current_epoch,
+                save_dir=self.save_root
+            )
+        
+
+        for layer_name, extractor in self.trans_extractors.items():
+            trans_feat = extractor.predict(self.X_small, verbose=0)
+            save_transformer_feature_maps( 
+                feat=trans_feat,
+                layer_name=layer_name,
+                epoch=current_epoch,
+                save_dir=self.save_root)
+        
+        gc.collect()
+        tf.keras.backend.clear_session()
+
+
+if __name__ == "__main__":
+
+    cnn_target_layers = ['conv2d_2', 'conv2d_6', 'conv2d_8'] 
+    trans_target_layers = ['transformer_block_1', 'transformer_block_3']  
+
+    feat_save_callback = SaveMultiLayerFeaturesCallback(
+        small_data=(X_small, Z_small),
+        cnn_target_layers=cnn_target_layers,
+        trans_target_layers=trans_target_layers)
+
+    history = model.fit(
+        [X_train, Z_train], 
+        [y_train, y_train, y_train],
+        validation_data=validation_data,
+        epochs=252,
+        batch_size=4,
+        callbacks=[early_stopping, feat_save_callback] )
+    
+
+print(f"X_smallsize：{X_small.shape} |(1, {len_shuru}, 1)")
+print(f"Z_smallsize：{Z_small.shape} |(1, 128, {int(len_shuru/ewaichouxi)}, 1)")
+
+
+
+
+
+fontsize = 12
+plt.figure()
+print(history.history.keys())
+plt.plot(history.history['y_loss'])
+plt.plot(history.history['val_y_loss'])
+plt.title('model loss', fontdict={'size': fontsize+2})
+plt.ylabel('loss', fontdict={'size':fontsize })
+plt.grid(True)
+plt.xlabel('epoch', fontdict={'size': fontsize})
+plt.legend(['train', 'validation'], loc='upper right', fontsize=fontsize)
+plt.tick_params(labelsize=fontsize)
+plt.show()
+plt.savefig('loss')
+
+
+plt.figure()
+print(history.history.keys())
+plt.plot(history.history['y_loss'])
+plt.plot(history.history['1d_loss'])
+plt.plot(history.history['2d_loss'])
+plt.title('train model loss', fontdict={'size': fontsize+2})
+plt.ylabel('loss', fontdict={'size': fontsize})
+plt.grid(True)
+plt.xlabel('epoch', fontdict={'size': fontsize})
+plt.legend(['y', '1d', '2d'], loc='upper right', fontsize=fontsize)
+plt.tick_params(labelsize=fontsize)
+plt.show()
+plt.savefig('train_loss')
+
+
+
+
+plt.figure()
+print(history.history.keys())
+plt.plot(history.history['val_y_loss'])
+plt.plot(history.history['val_1d_loss'])
+plt.plot(history.history['val_2d_loss'])
+plt.title('validation model loss', fontdict={'size': fontsize+2})
+plt.ylabel('val_loss', fontdict={'size': fontsize})
+plt.grid(True)
+plt.xlabel('epoch')
+plt.legend(['y', '1d', '2d'], loc='upper right', fontsize=fontsize)
+plt.tick_params(labelsize=fontsize)
+plt.show()
+plt.savefig('val_loss')
+
+
+plt.figure()
+print(history.history.keys())
+plt.plot(history.history['y_accuracy'])
+plt.plot(history.history['val_y_accuracy'])
+plt.title('model accuracy', fontdict={'size': fontsize+2})
+plt.ylabel('accuracy', fontdict={'size': fontsize})
+plt.xlabel('epoch', fontdict={'size': fontsize})
+plt.ylim([0, 1])
+plt.grid(True)
+plt.legend(['train', 'validation'], loc='lower right', fontsize=fontsize)
+plt.tick_params(labelsize=fontsize)
+plt.show()
+plt.savefig('accuracy')
+
+
+
+
+plt.figure()
+print(history.history.keys())
+plt.plot(history.history['y_accuracy'])
+plt.plot(history.history['1d_accuracy'])
+plt.plot(history.history['2d_accuracy'])
+plt.title('train model accuracy', fontdict={'size': fontsize+2})
+plt.ylabel('accuracy', fontdict={'size': fontsize})
+plt.xlabel('epoch', fontdict={'size': fontsize})
+plt.ylim([0, 1])
+plt.grid(True)
+plt.legend(['y', '1d','2d'], loc='lower right',  fontsize=fontsize)
+plt.tick_params(labelsize=fontsize)
+plt.show()
+plt.savefig('train_accuracy')
+
+
+plt.figure()
+print(history.history.keys())
+plt.plot(history.history['val_y_accuracy'])
+plt.plot(history.history['val_1d_accuracy'])
+plt.plot(history.history['val_2d_accuracy'])
+plt.title('validation model accuracy', fontdict={'size': fontsize+2})
+plt.ylabel('val_accuracy', fontdict={'size': fontsize})
+plt.xlabel('epoch')
+plt.ylim([0.7, 1])
+plt.grid(True)
+plt.legend(['y', '1d','2d'], loc='lower right', fontsize=fontsize)
+plt.tick_params(labelsize=fontsize)
+plt.show()
+plt.savefig('val_accuracy_1')
+
