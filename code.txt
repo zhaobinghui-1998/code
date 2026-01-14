@@ -522,8 +522,8 @@ target_layers = ["dense_9"]
 X_small = X_train[0:1]  
 Z_small = Z_train[0:1]  
 
-assert X_small.ndim == 3 and X_small.shape[0] == 1, f"X_small size failed：{X_small.shape}，需(1, {len_shuru}, 1)"
-assert Z_small.ndim == 4 and Z_small.shape[0] == 1, f"Z_small size failed：{Z_small.shape}，需(1, 128, ..., 1)"
+assert X_small.ndim == 3 and X_small.shape[0] == 1, f"X_small size failed：{X_small.shape}，(1, {len_shuru}, 1)"
+assert Z_small.ndim == 4 and Z_small.shape[0] == 1, f"Z_small size failed：{Z_small.shape}，(1, 128, ..., 1)"
 small_data = (X_small, Z_small)
 
 transformer_target_layers = ['transformer_block_1', 'transformer_block_3']        
@@ -574,7 +574,7 @@ def save_transformer_feature_maps(feat, layer_name, epoch, save_dir, cmap='plasm
     save_path = os.path.join(trans_save_dir, f'trans_{layer_name}_epoch{epoch}_merged.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✅ Transformer feather map（{layer_name}）：{save_path}")
+    print(f"Transformer feather map（{layer_name}）：{save_path}")
 
 
 
@@ -639,7 +639,7 @@ def save_cnn_feature_maps(feat, layer_name, epoch, save_dir, cmap='viridis'):
     save_path = os.path.join(cnn_save_dir, f'cnn_{layer_name}_epoch{epoch}_fixed.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✅CNN feather map：{save_path}")
+    print(f"CNN feather map：{save_path}")
     
 
 class SaveMultiLayerFeaturesCallback(Callback):
@@ -708,101 +708,4 @@ print(f"X_smallsize：{X_small.shape} |(1, {len_shuru}, 1)")
 print(f"Z_smallsize：{Z_small.shape} |(1, 128, {int(len_shuru/ewaichouxi)}, 1)")
 
 
-
-
-
-fontsize = 12
-plt.figure()
-print(history.history.keys())
-plt.plot(history.history['y_loss'])
-plt.plot(history.history['val_y_loss'])
-plt.title('model loss', fontdict={'size': fontsize+2})
-plt.ylabel('loss', fontdict={'size':fontsize })
-plt.grid(True)
-plt.xlabel('epoch', fontdict={'size': fontsize})
-plt.legend(['train', 'validation'], loc='upper right', fontsize=fontsize)
-plt.tick_params(labelsize=fontsize)
-plt.show()
-plt.savefig('loss')
-
-
-plt.figure()
-print(history.history.keys())
-plt.plot(history.history['y_loss'])
-plt.plot(history.history['1d_loss'])
-plt.plot(history.history['2d_loss'])
-plt.title('train model loss', fontdict={'size': fontsize+2})
-plt.ylabel('loss', fontdict={'size': fontsize})
-plt.grid(True)
-plt.xlabel('epoch', fontdict={'size': fontsize})
-plt.legend(['y', '1d', '2d'], loc='upper right', fontsize=fontsize)
-plt.tick_params(labelsize=fontsize)
-plt.show()
-plt.savefig('train_loss')
-
-
-
-
-plt.figure()
-print(history.history.keys())
-plt.plot(history.history['val_y_loss'])
-plt.plot(history.history['val_1d_loss'])
-plt.plot(history.history['val_2d_loss'])
-plt.title('validation model loss', fontdict={'size': fontsize+2})
-plt.ylabel('val_loss', fontdict={'size': fontsize})
-plt.grid(True)
-plt.xlabel('epoch')
-plt.legend(['y', '1d', '2d'], loc='upper right', fontsize=fontsize)
-plt.tick_params(labelsize=fontsize)
-plt.show()
-plt.savefig('val_loss')
-
-
-plt.figure()
-print(history.history.keys())
-plt.plot(history.history['y_accuracy'])
-plt.plot(history.history['val_y_accuracy'])
-plt.title('model accuracy', fontdict={'size': fontsize+2})
-plt.ylabel('accuracy', fontdict={'size': fontsize})
-plt.xlabel('epoch', fontdict={'size': fontsize})
-plt.ylim([0, 1])
-plt.grid(True)
-plt.legend(['train', 'validation'], loc='lower right', fontsize=fontsize)
-plt.tick_params(labelsize=fontsize)
-plt.show()
-plt.savefig('accuracy')
-
-
-
-
-plt.figure()
-print(history.history.keys())
-plt.plot(history.history['y_accuracy'])
-plt.plot(history.history['1d_accuracy'])
-plt.plot(history.history['2d_accuracy'])
-plt.title('train model accuracy', fontdict={'size': fontsize+2})
-plt.ylabel('accuracy', fontdict={'size': fontsize})
-plt.xlabel('epoch', fontdict={'size': fontsize})
-plt.ylim([0, 1])
-plt.grid(True)
-plt.legend(['y', '1d','2d'], loc='lower right',  fontsize=fontsize)
-plt.tick_params(labelsize=fontsize)
-plt.show()
-plt.savefig('train_accuracy')
-
-
-plt.figure()
-print(history.history.keys())
-plt.plot(history.history['val_y_accuracy'])
-plt.plot(history.history['val_1d_accuracy'])
-plt.plot(history.history['val_2d_accuracy'])
-plt.title('validation model accuracy', fontdict={'size': fontsize+2})
-plt.ylabel('val_accuracy', fontdict={'size': fontsize})
-plt.xlabel('epoch')
-plt.ylim([0.7, 1])
-plt.grid(True)
-plt.legend(['y', '1d','2d'], loc='lower right', fontsize=fontsize)
-plt.tick_params(labelsize=fontsize)
-plt.show()
-plt.savefig('val_accuracy_1')
 
