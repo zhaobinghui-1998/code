@@ -1,0 +1,669 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Apr 11 10:00:55 2025
+
+@author: zhaobinghui
+"""
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Conv1D, Conv2D, Dense, Dropout, BatchNormalization, 
+    Activation, MaxPooling1D, MaxPooling2D, GlobalAveragePooling1D, 
+    GlobalAveragePooling2D, Concatenate, Multiply, Lambda, Reshape
+)
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+import pywt
+import math
+import pickle
+import os
+
+# ============================================================
+# Configuration Parameters
+# ============================================================
+
+# Data parameters
+NUM_SAMPLES = 24000        # Total number of waveform samples
+WAVEFORM_LENGTH = 4096     # Length of each waveform
+DOWNSAMPLE_1D = 2          # Downsampling factor for 1D branch
+DOWNSAMPLE_2D = 2          # Downsampling factor for 2D branch
+
+# Model parameters
+EMBED_DIM = 64              # Transformer embedding dimension
+NUM_HEADS = 12              # Number of attention heads
+FF_DIM = 128               # Feed-forward dimension
+NUM_TRANSFORMER_BLOCKS = 4  # Number of Transformer blocks
+NUM_RESIDUAL_BLOCKS = 7     # Number of residual shrinkage blocks
+
+# Training parameters
+BATCH_SIZE = 4
+MAX_EPOCHS = 1000
+PATIENCE = 240              # Early stopping patience
+
+# Learning rate schedules
+INITIAL_LR = 0.0005
+DECAY_STEPS = 5400
+DECAY_RATE = 0.98
+
+# ============================================================
+# Utility Functions
+# ============================================================
+
+def abs_backend(inputs):
+    """Absolute value backend function"""
+    return tf.abs(inputs)
+
+def expand_dim_backend(inputs):
+    """Expand dimension backend function"""
+    return tf.expand_dims(inputs, 1)
+
+def sign_backend(inputs):
+    """Sign function backend"""
+    return tf.sign(inputs)
+
+def pad_backend(inputs, in_channels, out_channels):
+    """Padding backend function"""
+    pad_dim = (out_channels - in_channels) // 2
+    inputs = tf.expand_dims(inputs, axis=-1)
+    inputs = tf.pad(inputs, [[0, 0], [0, 0], [pad_dim, pad_dim], [0, 0]])
+    return tf.squeeze(inputs, axis=-1)
+
+# ============================================================
+# Custom Layers
+# ============================================================
+
+class ResidualShrinkageBlock1D(layers.Layer):
+    """Residual shrinkage block for 1D inputs"""
+    
+    def __init__(self, out_channels, downsample=False, downsample_strides=2):
+        super().__init__()
+        self.out_channels = out_channels
+        self.downsample = downsample
+        self.downsample_strides = downsample_strides
+        
+        self.bn1 = BatchNormalization()
+        self.relu1 = Activation('relu')
+        self.conv1 = Conv1D(out_channels, 3, strides=downsample_strides if downsample else 1,
+                           padding='same', kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))
+        
+        self.bn2 = BatchNormalization()
+        self.relu2 = Activation('relu')
+        self.conv2 = Conv1D(out_channels, 3, padding='same', 
+                           kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))
+        
+        # Thresholding layers
+        self.abs_layer = Lambda(abs_backend)
+        self.gap = GlobalAveragePooling1D()
+        self.dense1 = Dense(out_channels, activation=None, kernel_initializer='he_normal',
+                           kernel_regularizer=l2(1e-4))
+        self.bn3 = BatchNormalization()
+        self.relu3 = Activation('relu')
+        self.dense2 = Dense(out_channels, activation='sigmoid', kernel_regularizer=l2(1e-4))
+        self.expand_layer = Lambda(expand_dim_backend)
+        
+        # If downsampling needed
+        self.downsample_pool = AveragePooling1D(pool_size=1, strides=2) if downsample else None
+        
+    def build(self, input_shape):
+        self.in_channels = input_shape[-1]
+        
+    def call(self, inputs):
+        identity = inputs
+        
+        # First conv block
+        x = self.bn1(inputs)
+        x = self.relu1(x)
+        x = self.conv1(x)
+        
+        # Second conv block
+        x = self.bn2(x)
+        x = self.relu2(x)
+        x = self.conv2(x)
+        
+        # Soft thresholding
+        x_abs = self.abs_layer(x)
+        abs_mean = self.gap(x_abs)
+        
+        scales = self.dense1(abs_mean)
+        scales = self.bn3(scales)
+        scales = self.relu3(scales)
+        scales = self.dense2(scales)
+        scales = self.expand_layer(scales)
+        
+        thresholds = tf.multiply(abs_mean, scales)
+        
+        # Apply soft thresholding
+        sub = tf.subtract(x_abs, thresholds)
+        zeros = tf.subtract(sub, sub)
+        n_sub = tf.maximum(sub, zeros)
+        x = tf.multiply(Lambda(sign_backend)(x), n_sub)
+        
+        # Adjust identity if needed
+        if self.downsample and self.downsample_strides > 1:
+            identity = self.downsample_pool(identity)
+            
+        if self.in_channels != self.out_channels:
+            identity = Lambda(pad_backend, arguments={
+                'in_channels': self.in_channels, 
+                'out_channels': self.out_channels
+            })(identity)
+        
+        return layers.add([x, identity])
+
+class ResidualShrinkageBlock2D(layers.Layer):
+    """Residual shrinkage block for 2D inputs"""
+    
+    def __init__(self, out_channels, kernel_size=3, downsample=False, downsample_strides=2):
+        super().__init__()
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.downsample = downsample
+        
+        self.bn1 = BatchNormalization()
+        self.relu1 = Activation('relu')
+        self.conv1 = Conv2D(out_channels, kernel_size, 
+                           strides=(downsample_strides, downsample_strides) if downsample else (1, 1),
+                           padding='same', kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))
+        
+        self.bn2 = BatchNormalization()
+        self.relu2 = Activation('relu')
+        self.conv2 = Conv2D(out_channels, kernel_size, padding='same',
+                           kernel_initializer='he_normal', kernel_regularizer=l2(1e-4))
+        
+        # ECA attention mechanism
+        self.abs_layer = Lambda(abs_backend)
+        self.gap = GlobalAveragePooling2D()
+        self.reshape1 = Reshape((out_channels, 1))
+        
+        # Dynamically calculate kernel size for ECA
+        eca_kernel = int(abs((math.log(out_channels, 2) + 1) / 2))
+        eca_kernel = eca_kernel if eca_kernel % 2 else eca_kernel + 1
+        self.eca_conv = Conv1D(1, eca_kernel, activation='sigmoid', padding='same')
+        self.reshape2 = Reshape((1, out_channels))
+        
+        # If downsampling needed
+        self.downsample_pool = AveragePooling2D(pool_size=(1, 1), strides=(2, 2)) if downsample else None
+        
+    def build(self, input_shape):
+        self.in_channels = input_shape[-1]
+        
+    def call(self, inputs):
+        identity = inputs
+        
+        # First conv block
+        x = self.bn1(inputs)
+        x = self.relu1(x)
+        x = self.conv1(x)
+        
+        # Second conv block
+        x = self.bn2(x)
+        x = self.relu2(x)
+        x = self.conv2(x)
+        
+        # ECA attention with soft thresholding
+        x_abs = self.abs_layer(x)
+        abs_mean = self.gap(x_abs)
+        abs_mean_reshaped = self.reshape1(abs_mean)
+        
+        scales = self.eca_conv(abs_mean_reshaped)
+        scales = self.reshape2(scales)
+        
+        thresholds = tf.multiply(abs_mean, scales)
+        
+        # Apply soft thresholding
+        sub = tf.subtract(x_abs, thresholds)
+        zeros = tf.subtract(sub, sub)
+        n_sub = tf.maximum(sub, zeros)
+        x = tf.multiply(Lambda(sign_backend)(x), n_sub)
+        
+        # Adjust identity if needed
+        if self.downsample:
+            identity = self.downsample_pool(identity)
+            
+        if self.in_channels != self.out_channels:
+            identity = Lambda(pad_backend, arguments={
+                'in_channels': self.in_channels,
+                'out_channels': self.out_channels
+            })(identity)
+        
+        return layers.add([x, identity])
+
+class PositionalEncoding(layers.Layer):
+    """Positional encoding layer for Transformer"""
+    
+    def __init__(self, seq_len, embed_dim):
+        super().__init__()
+        self.seq_len = seq_len
+        self.embed_dim = embed_dim
+        
+    def build(self, input_shape):
+        position = tf.range(self.seq_len, dtype=tf.float32)[:, tf.newaxis]
+        div_term = tf.range(self.embed_dim, dtype=tf.float32)[tf.newaxis, :]
+        div_term = tf.pow(10000.0, -2.0 * (div_term // 2) / tf.cast(self.embed_dim, tf.float32))
+        
+        angle_rads = position * div_term
+        sines = tf.math.sin(angle_rads[:, 0::2])
+        cosines = tf.math.cos(angle_rads[:, 1::2])
+        
+        pos_encoding = tf.concat([sines, cosines], axis=-1)
+        pos_encoding = pos_encoding[tf.newaxis, ...]
+        self.pos_encoding = tf.cast(pos_encoding, dtype=tf.float32)
+        
+    def call(self, inputs):
+        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
+
+class TransformerBlock(layers.Layer):
+    """Transformer block with multi-head attention"""
+    
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate=0.1):
+        super().__init__()
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = keras.Sequential([
+            layers.Dense(ff_dim, activation="gelu", kernel_regularizer=l2(1e-4)),
+            layers.Dropout(dropout_rate),
+            layers.Dense(embed_dim, kernel_regularizer=l2(1e-4))
+        ])
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = layers.Dropout(dropout_rate)
+        self.dropout2 = layers.Dropout(dropout_rate)
+        
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+# ============================================================
+# Model Architecture
+# ============================================================
+
+def create_dual_branch_model(input_length_1d, input_shape_2d):
+    """
+    Create the dual-branch model architecture
+    
+    Args:
+        input_length_1d: Length of 1D input (after downsampling)
+        input_shape_2d: Shape of 2D input (height, width, channels)
+    
+    Returns:
+        Compiled Keras model
+    """
+    
+    # ================== 1D Branch (Transformer) ==================
+    x_input = Input(shape=(input_length_1d, 1), dtype=tf.float32, name='1d_input')
+    
+    # Initial processing
+    x = Conv1D(16, 5, strides=2, activation='relu', padding='same')(x_input)
+    x = MaxPooling1D(2)(x)
+    
+    # Transformer encoding
+    x = Dense(EMBED_DIM)(x)
+    seq_len = input_length_1d // (DOWNSAMPLE_1D * 2)  # Account for stride=2 in first conv
+    x = PositionalEncoding(seq_len, EMBED_DIM)(x)
+    x = BatchNormalization()(x)
+    
+    # Transformer blocks
+    for _ in range(NUM_TRANSFORMER_BLOCKS):
+        x = TransformerBlock(EMBED_DIM, NUM_HEADS, FF_DIM)(x)
+        x = MaxPooling1D(pool_size=3, strides=2, padding='same')(x)
+    
+    x = GlobalAveragePooling1D()(x)
+    x = Dropout(0.6)(x)
+    
+    # ================== 2D Branch (CNN) ==================
+    z_input = Input(shape=input_shape_2d, dtype=tf.float32, name='2d_input')
+    
+    # Initial processing
+    z = Conv2D(16, (1, 1), activation='relu', padding='same')(z_input)
+    
+    # Residual shrinkage blocks
+    for _ in range(NUM_RESIDUAL_BLOCKS):
+        z = ResidualShrinkageBlock2D(16, downsample=True)(z)
+        z = MaxPooling2D(pool_size=(1, 3), strides=(1, 2), padding='same')(z)
+    
+    z = GlobalAveragePooling2D()(z)
+    z = Dropout(0.6)(z)
+    
+    # ================== Feature Fusion ==================
+    # Attention-based fusion
+    attention = Dense(1, activation='sigmoid')(Concatenate()([z, x]))
+    weighted_cnn = Multiply()([z, attention])
+    weighted_transformer = Multiply()([x, 1 - attention])
+    
+    # Combined features
+    merged = Concatenate()([weighted_cnn, weighted_transformer])
+    
+    # Classification head
+    merged = Dense(64)(merged)
+    merged = BatchNormalization()(merged)
+    merged = Activation('relu')(merged)
+    merged = Dropout(0.4)(merged)
+    
+    merged = Dense(32)(merged)
+    merged = BatchNormalization()(merged)
+    merged = Activation('relu')(merged)
+    merged = Dropout(0.2)(merged)
+    
+    # Outputs
+    main_output = Dense(1, activation='sigmoid', name='main_output')(merged)
+    cnn_output = Dense(1, activation='sigmoid', name='cnn_output')(z)
+    transformer_output = Dense(1, activation='sigmoid', name='transformer_output')(x)
+    
+    # Create model
+    model = Model(inputs=[x_input, z_input], 
+                  outputs=[main_output, cnn_output, transformer_output])
+    
+    return model
+
+# ============================================================
+# Training Utilities
+# ============================================================
+
+def create_learning_rate_schedule(initial_lr=INITIAL_LR, decay_steps=DECAY_STEPS, decay_rate=DECAY_RATE):
+    """Create exponential decay learning rate schedule"""
+    return ExponentialDecay(
+        initial_learning_rate=initial_lr,
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
+        staircase=True
+    )
+
+def create_callbacks(monitor='val_main_output_accuracy', patience=PATIENCE):
+    """Create training callbacks"""
+    early_stopping = EarlyStopping(
+        monitor=monitor,
+        patience=patience,
+        verbose=1,
+        mode='max',
+        restore_best_weights=True,
+        min_delta=1e-7
+    )
+    
+    return [early_stopping]
+
+def evaluate_model(model, X_test, Z_test, y_test):
+    """Evaluate model performance on test set"""
+    predictions = model.predict([X_test, Z_test], verbose=1)
+    y_pred = predictions[0].flatten()
+    y_pred_class = (y_pred > 0.5).astype(int)
+    
+    # Calculate metrics
+    cm = confusion_matrix(y_test, y_pred_class)
+    tn, fp, fn, tp = cm.ravel()
+    
+    # Calculate recall
+    class_0_recall = tn / (tn + fp) if (tn + fp) > 0 else 0
+    class_1_recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    
+    print("\n" + "="*60)
+    print("MODEL EVALUATION")
+    print("="*60)
+    print(f"\nConfusion Matrix:\n{cm}")
+    print(f"\nClass 0 Recall: {class_0_recall:.4f} ({class_0_recall*100:.2f}%)")
+    print(f"Class 1 Recall: {class_1_recall:.4f} ({class_1_recall*100:.2f}%)")
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred_class, 
+                                target_names=['Class 0', 'Class 1']))
+    
+    return y_pred, y_pred_class
+
+# ============================================================
+# Visualization Functions
+# ============================================================
+
+def plot_training_history(history, max_epochs=200):
+    """Plot training history"""
+    if not history or not hasattr(history, 'history'):
+        print("No training history available")
+        return
+    
+    hist = history.history
+    total_epochs = len(hist.get('loss', []))
+    epochs_to_plot = min(max_epochs, total_epochs)
+    
+    if epochs_to_plot == 0:
+        print("No training data to plot")
+        return
+    
+    epochs_range = range(1, epochs_to_plot + 1)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Main loss
+    if 'loss' in hist and 'val_loss' in hist:
+        axes[0, 0].plot(epochs_range, hist['loss'][:epochs_to_plot], label='Train')
+        axes[0, 0].plot(epochs_range, hist['val_loss'][:epochs_to_plot], label='Validation')
+        axes[0, 0].set_title('Main Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+    
+    # Main accuracy
+    if 'main_output_accuracy' in hist and 'val_main_output_accuracy' in hist:
+        axes[0, 1].plot(epochs_range, hist['main_output_accuracy'][:epochs_to_plot], label='Train')
+        axes[0, 1].plot(epochs_range, hist['val_main_output_accuracy'][:epochs_to_plot], label='Validation')
+        axes[0, 1].set_title('Main Accuracy')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Accuracy')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].set_ylim([0, 1])
+    
+    # CNN branch loss
+    if 'cnn_output_loss' in hist:
+        axes[0, 2].plot(epochs_range, hist['cnn_output_loss'][:epochs_to_plot], label='CNN Branch')
+        axes[0, 2].set_title('CNN Branch Loss')
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Loss')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+    
+    # Transformer branch loss
+    if 'transformer_output_loss' in hist:
+        axes[1, 0].plot(epochs_range, hist['transformer_output_loss'][:epochs_to_plot], label='Transformer Branch')
+        axes[1, 0].set_title('Transformer Branch Loss')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Loss')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # CNN branch accuracy
+    if 'cnn_output_accuracy' in hist:
+        axes[1, 1].plot(epochs_range, hist['cnn_output_accuracy'][:epochs_to_plot], label='CNN Branch')
+        axes[1, 1].set_title('CNN Branch Accuracy')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Accuracy')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].set_ylim([0, 1])
+    
+    # Transformer branch accuracy
+    if 'transformer_output_accuracy' in hist:
+        axes[1, 2].plot(epochs_range, hist['transformer_output_accuracy'][:epochs_to_plot], label='Transformer Branch')
+        axes[1, 2].set_title('Transformer Branch Accuracy')
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Accuracy')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+        axes[1, 2].set_ylim([0, 1])
+    
+    plt.suptitle(f'Training History (Epochs 1-{epochs_to_plot})', fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# Main Execution
+# ============================================================
+
+def main():
+    """
+    Main execution function
+    Users should implement their own data loading logic here
+    """
+    
+    print("="*60)
+    print("DUAL-BRANCH SEISMIC EVENT CLASSIFIER")
+    print("="*60)
+    
+    # ================== Data Loading ==================
+    # NOTE: Replace this section with your own data loading logic
+    # The model expects:
+    #   X_train/X_val/X_test: 1D waveforms, shape (n_samples, sequence_length, 1)
+    #   Z_train/Z_val/Z_test: 2D time-frequency images, shape (n_samples, height, width, 1)
+    #   y_train/y_val/y_test: Labels, shape (n_samples,)
+    
+    print("\nLoading data...")
+    # TODO: Implement your data loading here
+    # Example:
+    # X_train, Z_train, y_train = load_your_data('train')
+    # X_val, Z_val, y_val = load_your_data('val')
+    # X_test, Z_test, y_test = load_your_data('test')
+    
+    # For demonstration, we'll create dummy data
+    # Remove this in your actual implementation
+    n_train, n_val, n_test = 1000, 200, 400
+    input_length_1d = WAVEFORM_LENGTH // DOWNSAMPLE_1D
+    tf_height, tf_width = 128, input_length_1d // DOWNSAMPLE_2D
+    
+    X_train = np.random.randn(n_train, input_length_1d, 1).astype(np.float32)
+    Z_train = np.random.randn(n_train, tf_height, tf_width, 1).astype(np.float32)
+    y_train = np.random.randint(0, 2, n_train)
+    
+    X_val = np.random.randn(n_val, input_length_1d, 1).astype(np.float32)
+    Z_val = np.random.randn(n_val, tf_height, tf_width, 1).astype(np.float32)
+    y_val = np.random.randint(0, 2, n_val)
+    
+    X_test = np.random.randn(n_test, input_length_1d, 1).astype(np.float32)
+    Z_test = np.random.randn(n_test, tf_height, tf_width, 1).astype(np.float32)
+    y_test = np.random.randint(0, 2, n_test)
+    
+    print(f"Training samples: {len(X_train)}")
+    print(f"Validation samples: {len(X_val)}")
+    print(f"Test samples: {len(X_test)}")
+    
+    # ================== Model Creation ==================
+    print("\nCreating model...")
+    input_shape_2d = (tf_height, tf_width, 1)
+    model = create_dual_branch_model(input_length_1d, input_shape_2d)
+    
+    # ================== Model Compilation ==================
+    lr_schedule = create_learning_rate_schedule()
+    optimizer = Adam(learning_rate=lr_schedule)
+    
+    model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    model.summary()
+    
+    # ================== Training ==================
+    print("\nStarting training...")
+    callbacks = create_callbacks()
+    
+    history = model.fit(
+        [X_train, Z_train],
+        [y_train, y_train, y_train],
+        validation_data=([X_val, Z_val], [y_val, y_val, y_val]),
+        epochs=MAX_EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=callbacks,
+        verbose=1
+    )
+    
+    # ================== Evaluation ==================
+    print("\nEvaluating model...")
+    y_pred, y_pred_class = evaluate_model(model, X_test, Z_test, y_test)
+    
+    # ================== Visualization ==================
+    print("\nPlotting training history...")
+    plot_training_history(history)
+    
+    # ================== Save Model ==================
+    print("\nSaving model and training history...")
+    model.save('seismic_classifier_model.h5')
+    
+    with open('training_history.pkl', 'wb') as f:
+        pickle.dump(history.history, f)
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE")
+    print("="*60)
+    print(f"Model saved: seismic_classifier_model.h5")
+    print(f"Training history saved: training_history.pkl")
+
+# ============================================================
+# CWT Preprocessing Function (Optional)
+# ============================================================
+
+def compute_cwt_features(waveforms, sampling_rate=100, wavename='cgau8', totalscal=256, 
+                         scale_range=(122, 250), downsampling_factor=2):
+    """
+    Compute Continuous Wavelet Transform features
+    
+    Args:
+        waveforms: Input waveforms, shape (n_samples, sequence_length)
+        sampling_rate: Sampling rate of waveforms
+        wavename: Wavelet name for CWT
+        totalscal: Total number of scales
+        scale_range: Range of scales to keep (start, end)
+        downsampling_factor: Downsampling factor for time axis
+    
+    Returns:
+        CWT features, shape (n_samples, n_scales, time_points, 1)
+    """
+    n_samples = len(waveforms)
+    
+    # Calculate scales
+    fc = pywt.central_frequency(wavename)
+    cparam = 2 * fc * totalscal
+    scales = cparam / np.arange(totalscal, 1, -1)
+    
+    # Select scales
+    scales_used = scales[scale_range[0]:scale_range[1]]
+    n_scales = len(scales_used)
+    
+    # Pre-allocate array
+    sequence_length = waveforms.shape[1]
+    time_points = sequence_length // downsampling_factor
+    cwt_features = np.zeros((n_samples, n_scales, time_points), dtype=np.float32)
+    
+    # Compute CWT for each sample
+    for i in range(n_samples):
+        cwtmatr, _ = pywt.cwt(waveforms[i], scales_used, wavename, 1.0 / sampling_rate)
+        cwt_features[i] = np.abs(cwtmatr[:, ::downsampling_factor])
+    
+    # Add channel dimension
+    cwt_features = cwt_features[..., np.newaxis]
+    
+    return cwt_features
+
+if __name__ == "__main__":
+    # Set GPU memory growth if available
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(f"GPU configuration failed: {e}")
+    
+    # Run main function
+    main()
+
+
+
